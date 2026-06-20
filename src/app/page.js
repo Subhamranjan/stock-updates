@@ -1,65 +1,688 @@
-import Image from "next/image";
+"use client";
 
-export default function Home() {
-  return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.js file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+import { useState, useEffect } from "react";
+import { getQuote } from "./actions";
+
+const STORAGE_KEY = "stock-watchlist";
+const REFRESH_INTERVAL = 300000;
+
+// ── Exchanges / markets ─────────────────────────────────────────────────────
+// suffix: appended to symbol for Yahoo Finance (empty string = no suffix, used for indices/FX as-is)
+// currency: display currency
+// label: shown in the exchange badge
+// tz: IANA timezone for market hours
+// open/close: market hours in that local timezone (24h, minutes)
+const MARKETS = {
+    NSE: { suffix: ".NS", currency: "INR", symbol: "₹", label: "NSE", tz: "Asia/Kolkata", open: [9, 30], close: [15, 0] },
+    BSE: { suffix: ".BO", currency: "INR", symbol: "₹", label: "BSE", tz: "Asia/Kolkata", open: [9, 15], close: [15, 30] },
+    NASDAQ: { suffix: "", currency: "USD", symbol: "$", label: "NASDAQ", tz: "America/New_York", open: [9, 30], close: [16, 0] },
+    NYSE: { suffix: "", currency: "USD", symbol: "$", label: "NYSE", tz: "America/New_York", open: [9, 30], close: [16, 0] },
+    TSE: { suffix: ".T", currency: "JPY", symbol: "¥", label: "Tokyo", tz: "Asia/Tokyo", open: [9, 0], close: [15, 0] },
+    LSE: { suffix: ".L", currency: "GBP", symbol: "£", label: "LSE", tz: "Europe/London", open: [8, 0], close: [16, 30] },
+    HKEX: { suffix: ".HK", currency: "HKD", symbol: "HK$", label: "HKEX", tz: "Asia/Hong_Kong", open: [9, 30], close: [16, 0] },
+    SSE: { suffix: ".SS", currency: "CNY", symbol: "¥", label: "Shanghai", tz: "Asia/Shanghai", open: [9, 30], close: [15, 0] },
+    COMMODITY: { suffix: "", currency: "USD", symbol: "$", label: "Commodity", tz: "America/New_York", open: [18, 0], close: [17, 0] }, // CME/NYMEX/COMEX ~23h electronic session (Sun 6pm - Fri 5pm ET, brief daily pause)
+};
+
+// Common commodity futures — Yahoo Finance tickers (CME/NYMEX/COMEX/ICE)
+// Symbol field stores the actual ticker since commodities don't follow the SYMBOL+suffix pattern.
+const COMMODITY_PRESETS = [
+    { label: "Gold", value: "GC=F" },
+    { label: "Silver", value: "SI=F" },
+    { label: "Crude Oil", value: "CL=F" },
+    { label: "Brent Crude", value: "BZ=F" },
+    { label: "Natural Gas", value: "NG=F" },
+    { label: "Copper", value: "HG=F" },
+    { label: "Platinum", value: "PL=F" },
+    { label: "Corn", value: "ZC=F" },
+    { label: "Wheat", value: "ZW=F" },
+    { label: "Soybean", value: "ZS=F" },
+    { label: "Cotton", value: "CT=F" },
+    { label: "Coffee", value: "KC=F" },
+];
+
+// Reference clocks shown as small badges only — NOT addable as cards.
+// Each entry just needs a label + a market hours definition to display a countdown.
+const REFERENCE_CLOCKS = [
+    { label: "NSE", tz: "Asia/Kolkata", open: [9, 30], close: [15, 0], alwaysOpen: false },
+    { label: "NASDAQ", tz: "America/New_York", open: [9, 30], close: [16, 0], alwaysOpen: false },
+    { label: "Tokyo", tz: "Asia/Tokyo", open: [9, 0], close: [15, 0], alwaysOpen: false },
+    { label: "London", tz: "Europe/London", open: [8, 0], close: [16, 30], alwaysOpen: false },
+    { label: "FX", tz: "Asia/Kolkata", open: [0, 0], close: [23, 59], alwaysOpen: true },
+    { label: "Commodities", tz: "America/New_York", open: [18, 0], close: [17, 0], alwaysOpen: true }, // ~23h electronic session, treat as always-on for the badge
+];
+
+// ── Market hours helpers (generic, works for any market in MARKETS) ────────
+
+function getLocalTime(tz) {
+    const now = new Date();
+    return new Date(now.toLocaleString("en-US", { timeZone: tz }));
+}
+
+function isMarketOpenForClock(clock) {
+    if (clock.alwaysOpen) return true;
+    const local = getLocalTime(clock.tz);
+    const day = local.getDay();
+    if (day === 0 || day === 6) return false;
+    const total = local.getHours() * 60 + local.getMinutes();
+    const openMin = clock.open[0] * 60 + clock.open[1];
+    const closeMin = clock.close[0] * 60 + clock.close[1];
+    return total >= openMin && total < closeMin;
+}
+
+function secondsUntilOpenForClock(clock) {
+    const local = getLocalTime(clock.tz);
+    const day = local.getDay();
+    const open = new Date(local);
+    open.setHours(clock.open[0], clock.open[1], 0, 0);
+    if (day === 0) open.setDate(open.getDate() + 1);
+    else if (day === 6) open.setDate(open.getDate() + 2);
+    else if (local >= open) open.setDate(open.getDate() + (day === 5 ? 3 : 1));
+    return Math.max(0, Math.floor((open - local) / 1000));
+}
+
+function secondsUntilCloseForClock(clock) {
+    const local = getLocalTime(clock.tz);
+    const close = new Date(local);
+    close.setHours(clock.close[0], clock.close[1], 0, 0);
+    return Math.max(0, Math.floor((close - local) / 1000));
+}
+
+function isMarketOpen(marketKey) {
+    const m = MARKETS[marketKey] || MARKETS.NSE;
+    const local = getLocalTime(m.tz);
+    const day = local.getDay();
+    if (day === 0 || day === 6) return false;
+    const total = local.getHours() * 60 + local.getMinutes();
+    const openMin = m.open[0] * 60 + m.open[1];
+    const closeMin = m.close[0] * 60 + m.close[1];
+    return total >= openMin && total < closeMin;
+}
+
+function formatSeconds(secs) {
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = secs % 60;
+    if (h > 0) return `${h}h ${m}m ${s}s`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+}
+
+// Maps a MARKETS key (NSE, NASDAQ, etc.) to its matching REFERENCE_CLOCKS entry for the dropdown badge.
+// Falls back to NSE hours if no exact clock exists for that market (e.g. BSE, HKEX, SSE share regional hours).
+function clockForMarket(marketKey) {
+    const found = REFERENCE_CLOCKS.find(c => c.label === MARKETS[marketKey]?.label);
+    if (found) return found;
+    const m = MARKETS[marketKey] || MARKETS.NSE;
+    return { label: m.label, tz: m.tz, open: m.open, close: m.close, alwaysOpen: false };
+}
+
+function daysSince(dateStr) {
+    if (!dateStr) return null;
+    const diff = Date.now() - new Date(dateStr).getTime();
+    return Math.floor(diff / (1000 * 60 * 60 * 24));
+}
+
+function calcRR(buyPrice, target, stopLoss, side = "buy") {
+    if (!buyPrice || !target || !stopLoss) return null;
+    const reward = side === "buy" ? target - buyPrice : buyPrice - target;
+    const risk = side === "buy" ? buyPrice - stopLoss : stopLoss - buyPrice;
+    if (reward <= 0 || risk <= 0) return null;
+    return (reward / risk).toFixed(2);
+}
+
+function fmtMoney(value, market) {
+    const m = MARKETS[market] || MARKETS.NSE;
+    if (value === null || value === undefined || isNaN(value)) return "-";
+    // FX pairs typically shown with 4 decimals, equities with 2
+    const decimals = market === "FX" ? 4 : 2;
+    const num = value.toLocaleString("en-IN", { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+    return m.symbol ? `${m.symbol}${num}` : num;
+}
+
+// ── RangeBar ──────────────────────────────────────────────────────────────────
+
+function RangeBar({ price, low52, high52, market }) {
+    if (!price || !low52 || !high52 || high52 === low52) return null;
+    const pct = Math.max(0, Math.min(100, ((price - low52) / (high52 - low52)) * 100));
+    return (
+        <div className="mt-1">
+            <div className="flex justify-between text-[10px] text-gray-400 mb-0.5">
+                <span>52W L {fmtMoney(low52, market)}</span>
+                <span>{fmtMoney(high52, market)} 52W H</span>
+            </div>
+            <div className="relative h-1.5 rounded-full bg-gray-100">
+                <div className="absolute h-full rounded-full bg-gradient-to-r from-red-400 via-amber-400 to-green-400" style={{ width: "100%" }} />
+                <div className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-2.5 h-2.5 rounded-full bg-white border-2 border-blue-500 shadow" style={{ left: `${pct}%` }} />
+            </div>
+            <p className="text-[10px] text-gray-400 mt-0.5 text-right">{pct.toFixed(1)}% of range</p>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+    );
+}
+
+// ── MarketBadge ───────────────────────────────────────────────────────────────
+// Shows open/close countdown for a given market (defaults to NSE if none passed)
+
+function MarketBadge({ clock }) {
+    const [open, setOpen] = useState(isMarketOpenForClock(clock));
+    const [countdown, setCountdown] = useState("");
+
+    useEffect(() => {
+        const tick = () => {
+            const o = isMarketOpenForClock(clock);
+            setOpen(o);
+            setCountdown(o
+                ? formatSeconds(secondsUntilCloseForClock(clock))
+                : formatSeconds(secondsUntilOpenForClock(clock))
+            );
+        };
+        tick();
+        const interval = setInterval(tick, 1000);
+        return () => clearInterval(interval);
+    }, [clock]);
+
+    return (
+        <div className="flex flex-col items-center min-w-[110px] rounded-md border border-gray-200 bg-gray-50 px-3 py-1.5 text-center">
+            <span className={`text-[10px] font-medium ${open ? "text-green-500" : "text-red-400"}`}>
+                {open ? `● ${clock.label} open` : `● ${clock.label} closed`}
+            </span>
+            <span className="text-sm font-mono font-semibold text-blue-600">{countdown}</span>
+            <span className="text-[10px] text-gray-400">{open ? "closes in" : "opens in"}</span>
         </div>
-      </main>
-    </div>
-  );
+    );
+}
+
+// ── ClockSelector ─────────────────────────────────────────────────────────────
+// Multi-select dropdown controlling which REFERENCE_CLOCKS badges are shown.
+
+function ClockSelector({ visible, onToggle }) {
+    const [open, setOpen] = useState(false);
+
+    return (
+        <div className="relative">
+            <button
+                onClick={() => setOpen(v => !v)}
+                className="rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 flex items-center gap-1.5"
+            >
+                Clocks
+                <span className="text-[10px] text-gray-400">({visible.length}/{REFERENCE_CLOCKS.length})</span>
+            </button>
+            {open && (
+                <>
+                    <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
+                    <div className="absolute z-20 mt-1 w-44 rounded-md border border-gray-200 bg-white shadow-lg py-1">
+                        {REFERENCE_CLOCKS.map((clock) => (
+                            <label
+                                key={clock.label}
+                                className="flex items-center gap-2 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50 cursor-pointer"
+                            >
+                                <input
+                                    type="checkbox"
+                                    checked={visible.includes(clock.label)}
+                                    onChange={() => onToggle(clock.label)}
+                                    className="accent-blue-500"
+                                />
+                                {clock.label}
+                            </label>
+                        ))}
+                    </div>
+                </>
+            )}
+        </div>
+    );
+}
+
+// ── StockCard ─────────────────────────────────────────────────────────────────
+
+function StockCard({ symbol, market, target, stopLoss, entryDate, notes, qty, buyPrice, side, mode, onRemove, onUpdate }) {
+    const [quote, setQuote] = useState(null);
+    const [showNotes, setShowNotes] = useState(false);
+    const m = MARKETS[market] || MARKETS.NSE;
+    const isTrading = mode !== "watch"; // default to trading mode if unset
+
+    useEffect(() => {
+        let active = true;
+        const fetchPrice = async () => {
+            // commodity tickers (e.g. GC=F) are stored complete; everything else gets the exchange suffix
+            const ticker = market === "COMMODITY" ? symbol : `${symbol}${m.suffix}`;
+            const data = await getQuote(ticker);
+            if (active) setQuote(data);
+        };
+        fetchPrice();
+        const interval = setInterval(fetchPrice, REFRESH_INTERVAL);
+        return () => { active = false; clearInterval(interval); };
+    }, [symbol, market]);
+
+    const price = quote?.price ?? null;
+    const daysHeld = daysSince(entryDate);
+    const rr = calcRR(buyPrice, target, stopLoss, side);
+
+    const status =
+        price === null ? "Loading"
+            : !isTrading ? "Watching"
+                : side === "buy"
+                    ? price >= target ? "Target hit"
+                        : price <= stopLoss ? "Stoploss hit"
+                            : "Holding"
+                    : price <= target ? "Target hit"
+                        : price >= stopLoss ? "Stoploss hit"
+                            : "Holding";
+
+    const badgeClasses =
+        status === "Target hit" ? "bg-green-100 text-green-700"
+            : status === "Stoploss hit" ? "bg-red-100 text-red-700"
+                : status === "Holding" ? "bg-amber-100 text-amber-700"
+                    : status === "Watching" ? "bg-blue-100 text-blue-700"
+                        : "bg-gray-100 text-gray-600";
+
+    const changeColor =
+        quote?.change > 0 ? "text-green-600"
+            : quote?.change < 0 ? "text-red-600"
+                : "text-gray-500";
+
+    const rrColor =
+        !rr ? "text-gray-400"
+            : rr >= 2 ? "text-green-600"
+                : rr >= 1 ? "text-amber-600"
+                    : "text-red-500";
+
+    const volChgPct = quote?.volume && quote?.prevVolume
+        ? ((quote.volume - quote.prevVolume) / quote.prevVolume * 100).toFixed(1)
+        : null;
+
+    return (
+        <div className="h-full flex flex-col gap-2 rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
+
+            {/* Header */}
+            <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                    <h3 className="text-base font-semibold text-gray-900">
+                        {market === "COMMODITY"
+                            ? (COMMODITY_PRESETS.find(c => c.value === symbol)?.label ?? symbol)
+                            : symbol}
+                    </h3>
+                    <span className="text-[10px] text-gray-400 font-medium">{m.label}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                    <button
+                        onClick={() => onUpdate("mode", isTrading ? "watch" : "trade")}
+                        className={`text-[10px] font-medium px-2 py-0.5 rounded-md border transition-colors ${isTrading
+                            ? "border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100"
+                            : "border-blue-300 bg-blue-50 text-blue-700 hover:bg-blue-100"
+                            }`}
+                        title={isTrading ? "Switch to watch-only" : "Switch to trading mode"}
+                    >
+                        {isTrading ? "Trading" : "Watch"}
+                    </button>
+                    {isTrading && (
+                        <button onClick={() => setShowNotes(v => !v)} className="text-xs text-gray-400 hover:text-blue-500 transition-colors" title="Trade notes">📝</button>
+                    )}
+                    <button
+                        onClick={onRemove}
+                        className="w-6 h-6 rounded-md border border-gray-300 text-gray-400 hover:text-red-600 hover:border-red-300 hover:bg-red-50 transition-colors flex items-center justify-center text-base leading-none"
+                        title="Remove this card"
+                    >
+                        ×
+                    </button>
+                </div>
+            </div>
+
+            {/* Qty row */}
+            {isTrading && (
+                <div className="flex items-center justify-between">
+                    <span className="text-xs text-gray-400">Qty</span>
+                    <div className="flex items-center gap-1.5">
+                        <button
+                            onClick={() => onUpdate("qty", Math.max(1, (qty || 1) - 1))}
+                            className="w-6 h-6 rounded-md border border-gray-300 text-gray-600 hover:bg-gray-100 text-sm font-medium flex items-center justify-center"
+                        >−</button>
+                        <input
+                            type="number"
+                            value={qty || 1}
+                            min={1}
+                            onChange={(e) => onUpdate("qty", Math.max(1, Number(e.target.value)))}
+                            className="w-16 text-center text-sm font-semibold text-gray-800 border border-gray-300 rounded-md py-0.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        />
+                        <button
+                            onClick={() => onUpdate("qty", (qty || 1) + 1)}
+                            className="w-6 h-6 rounded-md border border-gray-300 text-gray-600 hover:bg-gray-100 text-sm font-medium flex items-center justify-center"
+                        >+</button>
+                    </div>
+                    <span className="text-xs text-gray-400">
+                        {price !== null && qty ? fmtMoney(price * qty, market) : ""}
+                    </span>
+                </div>
+            )}
+
+            {/* Buy / Sell toggle */}
+            {isTrading && (
+                <div className="flex items-center justify-between">
+                    <span className="text-xs text-gray-400">Direction</span>
+                    <div className="flex rounded-md overflow-hidden border border-gray-300 text-xs font-medium">
+                        <button
+                            onClick={() => onUpdate("side", "buy")}
+                            className={`px-3 py-1 transition-colors ${side === "buy"
+                                ? "bg-green-500 text-white"
+                                : "bg-white text-gray-500 hover:bg-gray-50"}`}
+                        >Buy</button>
+                        <button
+                            onClick={() => onUpdate("side", "sell")}
+                            className={`px-3 py-1 transition-colors ${side === "sell"
+                                ? "bg-red-500 text-white"
+                                : "bg-white text-gray-500 hover:bg-gray-50"}`}
+                        >Sell</button>
+                    </div>
+                </div>
+            )}
+
+            {/* Price */}
+            <p className="text-2xl font-semibold text-gray-900">
+                {price !== null ? fmtMoney(price, market) : "..."}
+            </p>
+
+            {/* Change */}
+            {quote?.change !== undefined && quote?.change !== null && (
+                <p className={`text-sm font-medium ${changeColor}`}>
+                    {quote.change >= 0 ? "+" : ""}{quote.change.toFixed(2)} ({quote.changePercent?.toFixed(2)}%)
+                </p>
+            )}
+
+            {/* Status badge */}
+            <span className={`self-start rounded-md px-2.5 py-1 text-xs font-medium ${badgeClasses}`}>{status}</span>
+
+            {/* 52W range — shown in both modes */}
+            {quote?.low52Week && quote?.high52Week && (
+                <RangeBar price={price} low52={quote.low52Week} high52={quote.high52Week} market={market} />
+            )}
+
+            {/* Stats grid — trading mode only */}
+            {isTrading && (
+                <div className="grid grid-cols-3 gap-1 mt-1 text-center">
+                    <div className="rounded-lg bg-gray-50 px-2 py-1.5">
+                        <p className="text-[10px] text-gray-400">Volume</p>
+                        <p className="text-xs font-semibold text-gray-700">
+                            {quote?.volume ? (quote.volume / 1_00_000).toFixed(1) + "L" : "-"}
+                        </p>
+                    </div>
+                    <div className="rounded-lg bg-gray-50 px-2 py-1.5">
+                        <p className="text-[10px] text-gray-400">Prev Vol</p>
+                        <p className="text-xs font-semibold text-gray-700">
+                            {quote?.prevVolume ? (quote.prevVolume / 1_00_000).toFixed(1) + "L" : "-"}
+                        </p>
+                    </div>
+                    <div className="rounded-lg bg-gray-50 px-2 py-1.5">
+                        <p className="text-[10px] text-gray-400">Vol chg</p>
+                        <p className={`text-xs font-semibold ${volChgPct === null ? "text-gray-400" : Number(volChgPct) > 0 ? "text-blue-600" : "text-red-500"}`}>
+                            {volChgPct !== null ? `${volChgPct}%` : "-"}
+                        </p>
+                    </div>
+                    <div className="rounded-lg bg-gray-50 px-2 py-1.5">
+                        <p className="text-[10px] text-gray-400">Days held</p>
+                        <p className="text-xs font-semibold text-gray-700">{daysHeld ?? "-"}</p>
+                    </div>
+                    <div className="col-span-2 rounded-lg bg-gray-50 px-2 py-1.5">
+                        <p className="text-[10px] text-gray-400">R : R</p>
+                        <p className={`text-xs font-semibold ${rrColor}`}>{rr ? `1 : ${rr}` : "-"}</p>
+                    </div>
+                </div>
+            )}
+
+            {/* Inputs — trading mode only */}
+            {isTrading && (
+                <div className="mt-1 flex flex-col gap-1.5">
+                    <label className="flex items-center justify-between text-sm text-gray-600">
+                        <span>Target ({price !== null ? (target - price).toFixed(2) : "-"})</span>
+                        <input type="number" value={target} onChange={(e) => onUpdate("target", e.target.value)}
+                            className="w-24 rounded-md border border-gray-300 px-2 py-1 text-sm text-right focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                    </label>
+                    <label className="flex items-center justify-between text-sm text-gray-600">
+                        <span>Stop Loss ({price !== null ? (price - stopLoss).toFixed(2) : "-"})</span>
+                        <input type="number" value={stopLoss} onChange={(e) => onUpdate("stopLoss", e.target.value)}
+                            className="w-24 rounded-md border border-gray-300 px-2 py-1 text-sm text-right focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                    </label>
+                    <label className="flex items-center justify-between text-sm text-gray-600">
+                        <span>Entry date</span>
+                        <input type="date" value={entryDate || ""} onChange={(e) => onUpdate("entryDate", e.target.value)}
+                            className="w-36 rounded-md border border-gray-300 px-2 py-1 text-sm text-right focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                    </label>
+                    <label className="flex items-center justify-between text-sm text-gray-600">
+                        <span>Buy Price</span>
+                        <input type="number" value={buyPrice || ""} onChange={(e) => onUpdate("buyPrice", e.target.value)}
+                            className="w-24 rounded-md border border-gray-300 px-2 py-1 text-sm text-right focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            placeholder="0" />
+                    </label>
+                </div>
+            )}
+
+            {/* P&L — trading mode only */}
+            {isTrading && buyPrice > 0 && price !== null && qty > 0 && (() => {
+                const pnl = side === "buy"
+                    ? (price - buyPrice) * qty
+                    : (buyPrice - price) * qty;
+                const pnlPct = side === "buy"
+                    ? ((price - buyPrice) / buyPrice) * 100
+                    : ((buyPrice - price) / buyPrice) * 100;
+                const isProfit = pnl >= 0;
+                return (
+                    <div className={`rounded-lg px-3 py-2 ${isProfit ? "bg-green-50 border border-green-100" : "bg-red-50 border border-red-100"}`}>
+                        <div className="flex items-center justify-between">
+                            <span className="text-[10px] text-gray-400">P&L ({daysHeld ?? 0}d)</span>
+                            <span className={`text-[10px] font-medium ${isProfit ? "text-green-600" : "text-red-500"}`}>
+                                {pnlPct.toFixed(2)}%
+                            </span>
+                        </div>
+                        <p className={`text-base font-semibold ${isProfit ? "text-green-600" : "text-red-500"}`}>
+                            {isProfit ? "+" : ""}{fmtMoney(pnl, market)}
+                        </p>
+                        <div className="flex justify-between text-[10px] text-gray-400 mt-0.5">
+                            <span>Buy {fmtMoney(buyPrice, market)}</span>
+                            <span>Now {fmtMoney(price, market)}</span>
+                        </div>
+                    </div>
+                );
+            })()}
+
+            {/* Notes — trading mode only */}
+            {isTrading && showNotes && (
+                <textarea value={notes || ""} onChange={(e) => onUpdate("notes", e.target.value)}
+                    placeholder="Trade thesis, setup, key levels..." rows={3}
+                    className="mt-1 w-full rounded-md border border-gray-300 px-2 py-1.5 text-xs text-gray-700 resize-none focus:outline-none focus:ring-2 focus:ring-blue-500" />
+            )}
+        </div>
+    );
+}
+
+// ── Responsive column count ─────────────────────────────────────────────────
+// Desktop stays fixed at 4 columns (per existing behavior).
+// Phone (<640px) drops to 1 column, tablet (640–1024px) drops to 2 columns.
+function useResponsiveColumns(desktopColumns = 4) {
+    const [columns, setColumns] = useState(desktopColumns);
+
+    useEffect(() => {
+        const compute = () => {
+            const w = window.innerWidth;
+            if (w < 640) return 1;       // phone
+            if (w < 1024) return 2;      // tablet
+            return desktopColumns;       // desktop
+        };
+        const onResize = () => setColumns(compute());
+        onResize();
+        window.addEventListener("resize", onResize);
+        return () => window.removeEventListener("resize", onResize);
+    }, [desktopColumns]);
+
+    return columns;
+}
+
+const CLOCKS_STORAGE_KEY = "stock-dashboard-visible-clocks";
+
+export default function Dashboard() {
+    const [stocks, setStocks] = useState([]);
+    const [search, setSearch] = useState("");
+    const [selectedMarket, setSelectedMarket] = useState("NSE");
+    const [loaded, setLoaded] = useState(false);
+    const [showCommodities, setShowCommodities] = useState(false);
+    const [visibleClocks, setVisibleClocks] = useState(REFERENCE_CLOCKS.map(c => c.label));
+    const [layout, setLayout] = useState("masonry"); // "masonry" = compact dense packing (default), "wide" = one-size flex layout
+    const columns = useResponsiveColumns(4);
+
+    useEffect(() => {
+        try {
+            const saved = localStorage.getItem(CLOCKS_STORAGE_KEY);
+            if (saved) setVisibleClocks(JSON.parse(saved));
+        } catch { /* ignore */ }
+    }, []);
+
+    useEffect(() => {
+        if (loaded) localStorage.setItem(CLOCKS_STORAGE_KEY, JSON.stringify(visibleClocks));
+    }, [visibleClocks, loaded]);
+
+    const toggleClock = (label) => {
+        setVisibleClocks(prev =>
+            prev.includes(label) ? prev.filter(l => l !== label) : [...prev, label]
+        );
+    };
+
+    useEffect(() => {
+        try {
+            const saved = localStorage.getItem(STORAGE_KEY);
+            const parsed = saved ? JSON.parse(saved) : null;
+            setStocks(parsed
+                ? parsed.map(s => ({ qty: 1, buyPrice: 0, side: "buy", mode: "trade", market: s.exchange === "BO" ? "BSE" : (s.market || "NSE"), ...s }))
+                : [{ symbol: "RELIANCE", market: "NSE", target: 3100, stopLoss: 2850, entryDate: "", notes: "", qty: 1, buyPrice: 0, side: "buy", mode: "trade" }]
+            );
+        } catch {
+            setStocks([{ symbol: "RELIANCE", market: "NSE", target: 3100, stopLoss: 2850, entryDate: "", notes: "", qty: 1, buyPrice: 0, side: "buy", mode: "trade" }]);
+        }
+        setLoaded(true);
+    }, []);
+
+    useEffect(() => {
+        if (loaded) localStorage.setItem(STORAGE_KEY, JSON.stringify(stocks));
+    }, [stocks, loaded]);
+
+    const addStock = (overrideSymbol, overrideMarket) => {
+        const sym = typeof overrideSymbol === "string" ? overrideSymbol : search;
+        const mkt = overrideMarket ?? selectedMarket;
+        if (!sym) return;
+        setStocks([...stocks, {
+            symbol: overrideSymbol ? sym : sym.toUpperCase(),
+            market: mkt,
+            target: 0,
+            stopLoss: 0,
+            entryDate: "",
+            notes: "",
+            qty: 1,
+            buyPrice: 0,
+            side: "buy",
+            mode: mkt === "COMMODITY" ? "watch" : "trade",
+        }]);
+        setSearch("");
+        setShowCommodities(false);
+    };
+
+    const update = (idx, field, value) => {
+        const copy = [...stocks];
+        copy[idx][field] = ["target", "stopLoss", "qty", "buyPrice"].includes(field) ? Number(value) : value;
+        setStocks(copy);
+    };
+
+    if (!loaded) return null;
+
+    return (
+        <div className="w-full px-3 sm:px-4 md:px-6 py-4 md:py-6">
+
+            {/* Search + market selector */}
+            <div className="mb-4 flex flex-wrap items-center gap-2">
+                <select
+                    value={selectedMarket}
+                    onChange={(e) => setSelectedMarket(e.target.value)}
+                    className="rounded-md border border-gray-300 px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                >
+                    {Object.entries(MARKETS).filter(([k]) => k !== "COMMODITY").map(([key, m]) => (
+                        <option key={key} value={key}>{m.label}</option>
+                    ))}
+                </select>
+
+                <MarketBadge clock={clockForMarket(selectedMarket)} />
+                <ClockSelector visible={visibleClocks} onToggle={toggleClock} />
+
+                <input
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    placeholder={`Search ${MARKETS[selectedMarket].label} symbol e.g. ${selectedMarket === "NSE" ? "TCS" : selectedMarket === "TSE" ? "7203" : "AAPL"}`}
+                    onKeyDown={(e) => e.key === "Enter" && addStock()}
+                    className="flex-1 min-w-[200px] rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+                <button
+                    onClick={() => addStock()}
+                    className="rounded-md border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+                >
+                    Add
+                </button>
+                <button
+                    onClick={() => setShowCommodities(v => !v)}
+                    className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm font-medium text-amber-700 hover:bg-amber-100"
+                >
+                    Commodities
+                </button>
+            </div>
+
+            {/* Commodity quick-add panel */}
+            {showCommodities && (
+                <div className="mb-4 flex flex-wrap gap-2 rounded-lg border border-gray-200 bg-gray-50 p-3">
+                    {COMMODITY_PRESETS.map((c) => (
+                        <button
+                            key={c.value}
+                            onClick={() => addStock(c.value, "COMMODITY")}
+                            className="rounded-md border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-amber-50 hover:border-amber-300"
+                        >
+                            {c.label}
+                        </button>
+                    ))}
+                </div>
+            )}
+
+            {/* Reference market clocks — informational only, not tied to any stock */}
+            {visibleClocks.length > 0 && (
+                <div className="mb-4 flex flex-wrap gap-2">
+                    {REFERENCE_CLOCKS.filter(clock => visibleClocks.includes(clock.label)).map((clock) => (
+                        <MarketBadge key={clock.label} clock={clock} />
+                    ))}
+                </div>
+            )}
+
+            {layout === "wide" ? (
+                <div className="flex flex-wrap gap-4">
+                    {stocks.map((s, idx) => (
+                        <div key={`${s.symbol}-${s.market}-${idx}`} className="w-80">
+                            <StockCard
+                                {...s}
+                                onRemove={() => setStocks(stocks.filter((_, i) => i !== idx))}
+                                onUpdate={(field, val) => update(idx, field, val)}
+                            />
+                        </div>
+                    ))}
+                </div>
+            ) : (
+                // True masonry via CSS multi-column: each card breaks cleanly, flows
+                // top-to-bottom-then-next-column, so cards of any height pack tightly
+                // without leftover gaps — unlike CSS grid's row-span trick.
+                <div className="gap-4" style={{ columnCount: columns, columnGap: "1rem" }}>
+                    {stocks.map((s, idx) => (
+                        <div
+                            key={`${s.symbol}-${s.market}-${idx}`}
+                            className="mb-4 break-inside-avoid"
+                        >
+                            <StockCard
+                                {...s}
+                                onRemove={() => setStocks(stocks.filter((_, i) => i !== idx))}
+                                onUpdate={(field, val) => update(idx, field, val)}
+                            />
+                        </div>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
 }
