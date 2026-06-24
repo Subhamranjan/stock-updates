@@ -3,15 +3,8 @@
 import { useState, useEffect, useRef } from "react";
 import { getQuote } from "./actions";
 
-// const STORAGE_KEY = "stock-watchlist";
 const REFRESH_INTERVAL = 300000;
 
-// ── Exchanges / markets ─────────────────────────────────────────────────────
-// suffix: appended to symbol for Yahoo Finance (empty string = no suffix, used for indices/FX as-is)
-// currency: display currency
-// label: shown in the exchange badge
-// tz: IANA timezone for market hours
-// open/close: market hours in that local timezone (24h, minutes)
 const MARKETS = {
     NSE: { suffix: ".NS", currency: "INR", symbol: "₹", label: "NSE", tz: "Asia/Kolkata", open: [9, 30], close: [15, 0] },
     BSE: { suffix: ".BO", currency: "INR", symbol: "₹", label: "BSE", tz: "Asia/Kolkata", open: [9, 15], close: [15, 30] },
@@ -21,11 +14,9 @@ const MARKETS = {
     LSE: { suffix: ".L", currency: "GBP", symbol: "£", label: "LSE", tz: "Europe/London", open: [8, 0], close: [16, 30] },
     HKEX: { suffix: ".HK", currency: "HKD", symbol: "HK$", label: "HKEX", tz: "Asia/Hong_Kong", open: [9, 30], close: [16, 0] },
     SSE: { suffix: ".SS", currency: "CNY", symbol: "¥", label: "Shanghai", tz: "Asia/Shanghai", open: [9, 30], close: [15, 0] },
-    COMMODITY: { suffix: "", currency: "USD", symbol: "$", label: "Commodity", tz: "America/New_York", open: [18, 0], close: [17, 0] }, // CME/NYMEX/COMEX ~23h electronic session (Sun 6pm - Fri 5pm ET, brief daily pause)
+    COMMODITY: { suffix: "", currency: "USD", symbol: "$", label: "Commodity", tz: "America/New_York", open: [18, 0], close: [17, 0] },
 };
 
-// Common commodity futures — Yahoo Finance tickers (CME/NYMEX/COMEX/ICE)
-// Symbol field stores the actual ticker since commodities don't follow the SYMBOL+suffix pattern.
 const COMMODITY_PRESETS = [
     { label: "Gold", value: "GC=F" },
     { label: "Silver", value: "SI=F" },
@@ -41,18 +32,16 @@ const COMMODITY_PRESETS = [
     { label: "Coffee", value: "KC=F" },
 ];
 
-// Reference clocks shown as small badges only — NOT addable as cards.
-// Each entry just needs a label + a market hours definition to display a countdown.
 const REFERENCE_CLOCKS = [
     { label: "NSE", tz: "Asia/Kolkata", open: [9, 30], close: [15, 0], alwaysOpen: false },
     { label: "NASDAQ", tz: "America/New_York", open: [9, 30], close: [16, 0], alwaysOpen: false },
     { label: "Tokyo", tz: "Asia/Tokyo", open: [9, 0], close: [15, 0], alwaysOpen: false },
     { label: "London", tz: "Europe/London", open: [8, 0], close: [16, 30], alwaysOpen: false },
     { label: "FX", tz: "Asia/Kolkata", open: [0, 0], close: [23, 59], alwaysOpen: true },
-    { label: "Commodities", tz: "America/New_York", open: [18, 0], close: [17, 0], alwaysOpen: true }, // ~23h electronic session, treat as always-on for the badge
+    { label: "Commodities", tz: "America/New_York", open: [18, 0], close: [17, 0], alwaysOpen: true },
 ];
 
-// ── Market hours helpers (generic, works for any market in MARKETS) ────────
+// ── Market hours ────────
 
 function getLocalTime(tz) {
     const now = new Date();
@@ -88,17 +77,6 @@ function secondsUntilCloseForClock(clock) {
     return Math.max(0, Math.floor((close - local) / 1000));
 }
 
-function isMarketOpen(marketKey) {
-    const m = MARKETS[marketKey] || MARKETS.NSE;
-    const local = getLocalTime(m.tz);
-    const day = local.getDay();
-    if (day === 0 || day === 6) return false;
-    const total = local.getHours() * 60 + local.getMinutes();
-    const openMin = m.open[0] * 60 + m.open[1];
-    const closeMin = m.close[0] * 60 + m.close[1];
-    return total >= openMin && total < closeMin;
-}
-
 function formatSeconds(secs) {
     const h = Math.floor(secs / 3600);
     const m = Math.floor((secs % 3600) / 60);
@@ -108,8 +86,6 @@ function formatSeconds(secs) {
     return `${s}s`;
 }
 
-// Maps a MARKETS key (NSE, NASDAQ, etc.) to its matching REFERENCE_CLOCKS entry for the dropdown badge.
-// Falls back to NSE hours if no exact clock exists for that market (e.g. BSE, HKEX, SSE share regional hours).
 function clockForMarket(marketKey) {
     const found = REFERENCE_CLOCKS.find(c => c.label === MARKETS[marketKey]?.label);
     if (found) return found;
@@ -161,8 +137,6 @@ function RangeBar({ price, low52, high52, market }) {
 }
 
 // ── MarketBadge ───────────────────────────────────────────────────────────────
-// Shows open/close countdown for a given market (defaults to NSE if none passed)
-
 function MarketBadge({ clock }) {
     const [open, setOpen] = useState(isMarketOpenForClock(clock));
     const [countdown, setCountdown] = useState("");
@@ -193,7 +167,6 @@ function MarketBadge({ clock }) {
 }
 
 // ── ClockSelector ─────────────────────────────────────────────────────────────
-// Multi-select dropdown controlling which REFERENCE_CLOCKS badges are shown.
 
 function ClockSelector({ visible, onToggle }) {
     const [open, setOpen] = useState(false);
@@ -238,12 +211,11 @@ function StockCard({ symbol, market, target, stopLoss, entryDate, notes, qty, bu
     const [quote, setQuote] = useState(null);
     const [showNotes, setShowNotes] = useState(false);
     const m = MARKETS[market] || MARKETS.NSE;
-    const isTrading = mode !== "watch"; // default to trading mode if unset
+    const isTrading = mode !== "watch";
 
     useEffect(() => {
         let active = true;
         const fetchPrice = async () => {
-            // commodity tickers (e.g. GC=F) are stored complete; everything else gets the exchange suffix
             const ticker = market === "COMMODITY" ? symbol : `${symbol}${m.suffix}`;
             const data = await getQuote(ticker);
             if (active) setQuote(data);
@@ -493,8 +465,7 @@ function StockCard({ symbol, market, target, stopLoss, entryDate, notes, qty, bu
 }
 
 // ── Responsive column count ─────────────────────────────────────────────────
-// Desktop stays fixed at 4 columns (per existing behavior).
-// Phone (<640px) drops to 1 column, tablet (640–1024px) drops to 2 columns.
+
 function useResponsiveColumns(desktopColumns = 4) {
     const [columns, setColumns] = useState(desktopColumns);
 
@@ -607,7 +578,6 @@ export default function Dashboard() {
             return copy;
         });
 
-        // Debounce the DB write (avoids a PUT on every keystroke)
         clearTimeout(updateTimers.current[idx]);
         updateTimers.current[idx] = setTimeout(() => {
             setStocks(prev => {

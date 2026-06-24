@@ -1,4 +1,5 @@
-CREATE TABLE IF NOT EXISTS watchlist (
+export const schema = `
+  CREATE TABLE IF NOT EXISTS watchlist (
     id        SERIAL PRIMARY KEY,
     symbol    VARCHAR(30)  NOT NULL,
     market    VARCHAR(20)  NOT NULL DEFAULT 'NSE',
@@ -12,4 +13,5 @@ CREATE TABLE IF NOT EXISTS watchlist (
     notes     TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
-);
+  );
+`;
