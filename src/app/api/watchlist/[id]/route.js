@@ -55,7 +55,7 @@ export async function DELETE(req, { params }) {
 function dbToClient(row) {
     return {
         id: row.id,
-        symbol: row.symbol,   // ← make sure this line exists
+        symbol: row.symbol,
         market: row.market,
         target: Number(row.target),
         stopLoss: Number(row.stop_loss),

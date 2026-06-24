@@ -22,7 +22,6 @@ export async function PUT(req) {
             [visible, label]
         );
         if (!rows.length) {
-            // Insert if not exists
             const inserted = await pool.query(
                 `INSERT INTO market_clocks (label, visible) VALUES ($1, $2) RETURNING *`,
                 [label, visible]
